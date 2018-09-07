@@ -1,42 +1,63 @@
 const fs = require('fs');
 const os = require('os');
-const npmName = require('npm-name');
+const got = require('got');
+const registryUrl = require('registry-url')();
 const pify = require('pify');
 const recast = require('recast');
+const path = require('path');
 
-const fileName = `${os.homedir()}/.hyper.js`;
+const devConfigFileName = path.join(__dirname, `../.hyper.js`);
 
-let fileContents;
-let parsedFile;
-let plugins;
-let localPlugins;
+let fileName =
+  process.env.NODE_ENV !== 'production' && fs.existsSync(devConfigFileName)
+    ? devConfigFileName
+    : `${os.homedir()}/.hyper.js`;
 
-try {
-  fileContents = fs.readFileSync(fileName, 'utf8');
-
-  parsedFile = recast.parse(fileContents);
-
-  const properties = parsedFile.program.body[0].expression.right.properties;
-  plugins = properties.find(property => {
-    return property.key.name === 'plugins';
-  }).value.elements;
-
-  localPlugins = properties.find(property => {
-    return property.key.name === 'localPlugins';
-  }).value.elements;
-} catch (err) {
-  if (err.code !== 'ENOENT') {
-    // ENOENT === !exists()
-    throw err;
-  }
+/**
+ * We need to make sure the file reading and parsing is lazy so that failure to
+ * statically analyze the hyper configuration isn't fatal for all kinds of
+ * subcommands. We can use memoization to make reading and parsing lazy.
+ */
+function memoize(fn) {
+  let hasResult = false;
+  let result;
+  return (...args) => {
+    if (!hasResult) {
+      result = fn(...args);
+      hasResult = true;
+    }
+    return result;
+  };
 }
 
+const getFileContents = memoize(() => {
+  try {
+    return fs.readFileSync(fileName, 'utf8');
+  } catch (err) {
+    if (err.code !== 'ENOENT') {
+      // ENOENT === !exists()
+      throw err;
+    }
+  }
+  return null;
+});
+
+const getParsedFile = memoize(() => recast.parse(getFileContents()));
+
+const getProperties = memoize(() => getParsedFile().program.body[0].expression.right.properties);
+
+const getPlugins = memoize(() => getProperties().find(property => property.key.name === 'plugins').value.elements);
+
+const getLocalPlugins = memoize(
+  () => getProperties().find(property => property.key.name === 'localPlugins').value.elements
+);
+
 function exists() {
-  return fileContents !== undefined;
+  return getFileContents() !== undefined;
 }
 
 function isInstalled(plugin, locally) {
-  const array = locally ? localPlugins : plugins;
+  const array = locally ? getLocalPlugins() : getPlugins();
   if (array && Array.isArray(array)) {
     return array.find(entry => entry.value === plugin) !== undefined;
   }
@@ -44,22 +65,31 @@ function isInstalled(plugin, locally) {
 }
 
 function save() {
-  return pify(fs.writeFile)(fileName, recast.print(parsedFile).code, 'utf8');
+  return pify(fs.writeFile)(fileName, recast.print(getParsedFile()).code, 'utf8');
 }
 
 function existsOnNpm(plugin) {
-  plugin = plugin.split('#')[0].split('@')[0];
-  return npmName(plugin).then(unavailable => {
-    if (unavailable) {
-      const err = new Error(`${plugin} not found on npm`);
-      err.code = 'NOT_FOUND_ON_NPM';
-      throw err;
+  const name = getPackageName(plugin);
+  return got.get(registryUrl + name.toLowerCase(), {timeout: 10000, json: true}).then(res => {
+    if (!res.body.versions) {
+      return Promise.reject(res);
     }
   });
 }
 
+function getPackageName(plugin) {
+  const isScoped = plugin[0] === '@';
+  const nameWithoutVersion = plugin.split('#')[0];
+
+  if (isScoped) {
+    return '@' + nameWithoutVersion.split('@')[1].replace('/', '%2f');
+  }
+
+  return nameWithoutVersion.split('@')[0];
+}
+
 function install(plugin, locally) {
-  const array = locally ? localPlugins : plugins;
+  const array = locally ? getLocalPlugins() : getPlugins();
   return new Promise((resolve, reject) => {
     existsOnNpm(plugin)
       .then(() => {
@@ -73,11 +103,11 @@ function install(plugin, locally) {
           .catch(err => reject(err));
       })
       .catch(err => {
-        if (err.code === 'NOT_FOUND_ON_NPM') {
-          reject(err.message);
-        } else {
-          reject(err);
+        const {statusCode} = err;
+        if (statusCode && (statusCode === 404 || statusCode === 200)) {
+          return reject(`${plugin} not found on npm`);
         }
+        return reject(`${err.message}\nPlugin check failed. Check your internet connection or retry later.`);
       });
   });
 }
@@ -88,8 +118,8 @@ function uninstall(plugin) {
       return reject(`${plugin} is not installed`);
     }
 
-    const index = plugins.findIndex(entry => entry.value === plugin);
-    plugins.splice(index, 1);
+    const index = getPlugins().findIndex(entry => entry.value === plugin);
+    getPlugins().splice(index, 1);
     save()
       .then(resolve)
       .catch(err => reject(err));
@@ -97,8 +127,10 @@ function uninstall(plugin) {
 }
 
 function list() {
-  if (Array.isArray(plugins)) {
-    return plugins.map(plugin => plugin.value).join('\n');
+  if (Array.isArray(getPlugins())) {
+    return getPlugins()
+      .map(plugin => plugin.value)
+      .join('\n');
   }
   return false;
 }
